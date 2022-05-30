@@ -1,11 +1,11 @@
 #include <new.h>
 
 #include <Arduino.h>
-#include "HardwareSerial.h"
-#include "Temporizador.hpp"
-#include "function.hpp"
-#include "option.hpp"
-#include "future.hpp"
+
+#include "../timer.hpp"
+#include "../function.hpp"
+#include "../option.hpp"
+#include "../future.hpp"
 
 #define PIN_TX 13
 #define PIN_RTS 2
@@ -14,17 +14,7 @@
 #define PRESCALER 256
 #define PARITY ODD
 
-#define DEFINE_STATES(...)                                          \
-    typedef enum { __VA_ARGS__ } state_t;                           \
-    friend state_t operator++(state_t& st) {                        \
-        return st = static_cast<state_t>(static_cast<int>(st) + 1); \
-    }                                                               \
-
-
-enum parity {
-    EVEN = 0,
-    ODD,
-};
+enum parity { EVEN = 0, ODD };
 
 option<timer1> timer1::instance;
 
@@ -39,9 +29,9 @@ void wake_on_interrupt_for(waker& waker) {
     waker_pin_interrupt[Pin] = waker.clone();
 }
 
-void wake_on_loop(waker& waker) { waker_loop = waker.clone(); }
-void wake_on_next_tick(waker& waker) { waker_next_tick = waker.clone(); }
-void wake_on_serial_event(waker& waker) { waker_serial_ev = waker.clone(); }
+pending_t wake_on_loop(waker& waker) { waker_loop = waker.clone(); }
+pending_t wake_on_next_tick(waker& waker) { waker_next_tick = waker.clone(); }
+pending_t wake_on_serial_event(waker& waker) { waker_serial_ev = waker.clone(); }
 
 template <uint8_t P>
 void pin_interrupt_handler();
@@ -71,6 +61,10 @@ public:
                 timer1::instance->start();
                 wake_on_next_tick(waker);
                 return pending;
+
+            case WAIT_START:
+                if (digitalRead(PIN_RX) == LOW) return wake_on_loop(waker);
+                ++_state;
 
             case SENDING:
                 Serial.print("Send bit: ");
@@ -125,34 +119,35 @@ private:
     uint8_t _end_bit_count;
 };
 
-class serial_send_string_fsm : public future<int> {
+class serial_recv_string_fsm : public future<int> {
 public:
 
-    serial_send_string_fsm(String s)
-        : _s(s)
-        , _state(START)
+    serial_recv_string_fsm()
+        : _state(START)
         , _idx(0)
     { }
 
     poll_result<int> poll(waker& waker) {
         while (true) {
             switch (_state) {
-                case START: ++_state;
+                case START:
+                    Serial.println("Waiting start bit");
+                    ++_state;
 
-                case SEND_BYTE_LOOP:
-                    Serial.println("SEND_BYTE_LOOP");
-                    digitalWrite(PIN_RTS, HIGH);
-
-                    wake_on_interrupt_for<PIN_CTS>(waker);
+                case WAIT_RTS:
+                    wake_on_interrupt_for<PIN_RTS>(waker);
                     attachInterrupt(digitalPinToInterrupt(PIN_CTS),
-                            pin_interrupt_handler<PIN_CTS>, RISING);
-
-                    Serial.println("Waiting CTS HIGH");
-
+                            pin_interrupt_handler<PIN_RTS>, RISING);
                     ++_state;
                     return pending;
 
-                case RECEIVE_BEGIN_CTS:
+                case SEND_CTS:
+                    detachInterrupt(digitalPinToInterrupt(PIN_CTS));
+                    digitalWrite(PIN_CTS, HIGH);
+                    _recv_string_fut = serial_recv_string_fsm();
+                    ++_state;
+
+                case RECEIVE_BYTE_LOOP:
                     Serial.println("RECEIVE_BEGIN_CTS");
                     _send_byte_fut = serial_send_byte_fsm(_s[_idx]);
                     ++_state;
@@ -192,7 +187,7 @@ public:
 private:
     typedef enum {
         START = 0,
-        SEND_BYTE_LOOP,
+        RECV_BYTE_LOOP,
         RECEIVE_BEGIN_CTS,
         SENDING,
         RECEIVE_END_CTS,
@@ -216,45 +211,41 @@ public:
     poll_result<void> poll(waker& waker) {
         while (true) {
             switch (_state) {
-                case READ_STRING:
+                case WAIT_RTS:
+                    wake_on_interrupt_for<PIN_RTS>(waker);
+                    attachInterrupt(digitalPinToInterrupt(PIN_CTS),
+                            pin_interrupt_handler<PIN_RTS>, RISING);
+                    ++_state;
+                    return pending;
+
+                case SEND_CTS:
+                    detachInterrupt(digitalPinToInterrupt(PIN_CTS));
+                    digitalWrite(PIN_CTS, HIGH);
+                    ++_state;
+                    _recv_string_fut = serial_recv_string_fsm();
+
+                case RECEIVING:
                 {
-                    char c = ' ';
-                    while (Serial.available()) {
-                        c = Serial.read();
-                        if (c == '\n') break;
-                        _s.concat(c);
-                    }
-
-                    if (c == '\n' && _s.length() > 0) {
-                        ++_state;
-                        _send_string_fut = serial_send_string_fsm(_s);
-
-                        Serial.print("Sending: '");
-                        Serial.print(_s);
-                        Serial.println("'");
-                    } else {
-                        wake_on_serial_event(waker);
-                        return pending;
-                    }
-                }
-
-                case SENDING:
-                {
-                    auto res = _send_string_fut->poll(waker);
+                    auto res = _recv_string_fut->poll(waker);
                     if (!res) return pending;
-                    if (*res != 0) {
-                        Serial.println("Error: serial send with non-zero code");
-                        _state = READ_STRING;
-                        continue; // Go to READ_STRING
+                    if (*res) {
+                        _state = FAILED;
+                        continue;
                     }
-                    Serial.println("Done sending string");
+                    String& s = res->value();
+                    Serial.print("Received: ");
+                    Serial.println(s);
                     ++_state;
                 }
 
                 case END:
-                    _state = READ_STRING;
-                    _s = String();
+                    digitalWrite(PIN_CTS, LOW);
+                    _state = WAIT_RTS;
                     continue;
+
+                case FAILED:
+                    Serial.println("Error: failed to receive string");
+                    return pending;
 
                 default:
                     Serial.println("Invalid state");
@@ -264,15 +255,18 @@ public:
     }
 
 private:
-    typedef enum { READ_STRING = 0, SENDING, END, N_STATES } state_t;
+    typedef enum { WAIT_RTS = 0, RECEIVING, END, FAILED, N_STATES } state_t;
     friend state_t operator++(state_t& st) {
         return st = static_cast<state_t>(static_cast<int>(st) + 1);
     }
 
     state_t _state;
     String _s;
-    option<serial_send_string_fsm> _send_string_fut;
+    option<serial_recv_string_fsm> _recv_string_fut;
 };
+
+static main_fsm fut;
+static waker_fut main_waker(&fut);
 
 // Executada uma vez quando o Arduino reseta
 void setup(){
@@ -295,8 +289,7 @@ void setup(){
     // Habilita interrupcoes
     interrupts();
 
-    future<void>* fut = new main_fsm();
-    waker_loop = new waker_fut(fut);
+    wake_on_loop(&main_waker);
     Serial.println("Ready!");
 }
 

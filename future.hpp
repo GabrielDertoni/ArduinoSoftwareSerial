@@ -72,7 +72,7 @@ waker* make_waker_fn(Functor f) {
 
 class waker_fut : public waker {
 public:
-    waker_fut(future<void>* fut) : _fut(fut) { }
+    constexpr waker_fut(future<void>* fut) : _fut(fut) { }
 
     virtual waker* clone() override { return new waker_fut(_fut); };
     void wake() override { _fut->poll(*this); }
