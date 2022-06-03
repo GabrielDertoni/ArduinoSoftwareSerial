@@ -30,7 +30,7 @@ monitor:
 	arduino-cli monitor -p $(PORT)
 
 $(BUILD):
-	mkdir $@
+	mkdir -p $@
 
 clean:
 	rm -rf $(BUILD)
